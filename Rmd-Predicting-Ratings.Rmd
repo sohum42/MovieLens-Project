@@ -1,0 +1,593 @@
+---
+title: "Predicting Movie Recommendations"
+author: "Sohum Sanghvi"
+date: "3/6/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r movielens_setup, include=FALSE}
+################################
+# Create edx set, validation set
+################################
+
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding")
+# if using R 3.5 or earlier, use `set.seed(1)` instead
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+## Introduction
+The MovieLens dataset contains roughly 10 million ratings of movies, provided by 100,000 users. The goal of this project is to predict the ratings that a user will give to movies they have not yet rated. We start by exploring the variables in the dataset, such as the distribution of the ratings and which movies have been rated the most. After the initial analysis, we start building a dataset to predict ratings for. We create a dataset of users with movies they have not rated, and through machine learning approaches, we aim to predict the ratings the users will provide.
+
+## Analysis
+We begin by examining the edx (training) dataset. We can get a summary of the data as follows:
+```{r edx_summary}
+summary(edx)
+```
+
+We can start analyzing the distribution of ratings. From the summary, we know the ratings are always between 0.5 and 5 (inclusive), the average rating is about 3.5, and the median rating is 4. We further break down the average ratings by genre and year.
+
+The plot below shows the overall distribution of ratings. It appears that the most popular ratings are 3 and 4 out of 5. Another interesting point is that ratings ending in .5 are not used as frequently as whole number ratings.
+
+
+```{r ratings_dist, echo=FALSE}
+#Get counts of each rating (0.5,..., 4.5, 5.0)
+rating_counts = edx %>%
+  group_by(rating) %>%
+  summarize(rate_cnts = n()) %>%
+  mutate(rating = as.factor(rating)) %>%
+  ggplot(data = ., aes(rating, rate_cnts)) +
+  geom_bar(stat = "identity")
+
+rating_counts
+```
+
+Now, we can examine the average rating for movies with many reviews. Among those movies with many ratings, there appears to be significant variation in the average rating. This helps show that we must take the ratings of different movies into account when predicting user ratings. 
+
+
+```{r movies_cnt, echo=FALSE}
+#Get average rating of movies with at least 25,000 ratings
+movie_cnts = edx %>%
+  group_by(movieId, title) %>%
+  summarize(rate_cnts = n(), avg_rating = mean(rating)) %>%
+  arrange(-rate_cnts) %>%
+  filter(rate_cnts >= 25000) %>%
+  ggplot(data = ., aes(title, avg_rating)) +
+  geom_bar(aes(fill = "avg_rating"), stat = "identity") + 
+  ggtitle("Average Rating by Movie (min. 25K ratings)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) + 
+  labs(y = "Average Rating", x = "Title")
+
+movie_cnts
+```
+
+We can also examine the average rating for users with many reviews. Among those users with many ratings (at least 3000), there is a mix of harsh and lenient users. For instance, user 14463 tends to give much lower ratings, while user 27468 is much more lenient. 
+
+
+```{r users_cnt, echo=FALSE}
+#Get average rating of users with at least 3000 ratings
+user_cnts = edx %>%
+  group_by(userId) %>%
+  summarize(rate_cnts = n(), avg_rating = mean(rating), 
+            se_rating = sd(rating)/sqrt(n())) %>%
+  mutate(userId = as.factor(userId)) %>%
+  arrange(-rate_cnts) %>%
+  filter(rate_cnts >= 3000) %>%
+  ggplot(data = ., aes(userId, avg_rating)) +
+  geom_bar(aes(fill = "avg_rating"), stat = "identity") +
+  geom_errorbar(aes(ymin = avg_rating-2*se_rating, 
+                    ymax = avg_rating+2*se_rating)) + 
+  ggtitle("Average Rating by User (min. 3000 ratings)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) + 
+  labs(y = "Average Rating", x = "User ID")
+
+user_cnts
+```
+
+We can plot the ratings by each genre, but because there are too many different genre types, we only use the most common ones which have at least 100,000 ratings. The error bar plot below clearly shows that certain genres are more well-received than others. Clearly, comedy films receive lower ratings on average than drama.
+
+
+```{r ratings_by_genre, echo=FALSE}
+#Average Ratings by Genre (min. 100,000 ratings)
+avg_genre_rating = edx %>%
+  group_by(genres) %>%
+  summarize(cnts = n(), avg_rating = mean(rating), 
+            se_rating = sd(rating)/sqrt(n())) %>%
+  filter(cnts >= 100000)
+
+ggplot(avg_genre_rating, aes(reorder(genres, -avg_rating), 
+  avg_rating)) +
+  geom_point() + geom_errorbar(aes(ymin = avg_rating-2*se_rating,
+                               ymax = avg_rating+2*se_rating)) +
+  ggtitle("Average Rating by Genre (min. 100K ratings)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) + 
+  labs(y = "Average Rating", x = "Genre")
+```
+
+
+
+There is also some bias based on which year the movie was rated From the graph below, it is evident that earlier reviews tend to receive higher ratings than recent ones. 
+
+
+
+```{r ratings_by_year, echo=FALSE}
+#Average Ratings by Year
+avg_yr_rating = edx %>%
+  mutate(year = year(as.Date.POSIXct(timestamp))) %>%
+  group_by(year) %>%
+  summarize(cnts = n(), avg_rating = mean(rating))
+
+ggplot(avg_yr_rating, aes(year, avg_rating)) +
+  geom_bar(fill = "blue", stat="identity") + 
+  ggtitle("Average Rating by Year") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) + 
+  labs(y = "Average Rating", x = "Year")
+```
+
+## Prediction Methods
+For building our models, we first create a train and test set from the edx dataset. We follow the same steps as when splitting the MovieLens dataset into the edx and validation sets. 
+```{r train_test_split, include=FALSE}
+#Split edx into training and test set
+set.seed(1, sample.kind = "Rounding")
+test_index = createDataPartition(y = edx$rating, times = 1, p = 0.2, list = FALSE)
+train_edx = edx[-test_index,]
+temp_edx = edx[test_index,]
+
+test_edx = temp_edx %>%
+  semi_join(train_edx, by = "movieId") %>%
+  semi_join(train_edx, by = "userId")
+
+removed = anti_join(temp_edx, test_edx)
+train_edx = rbind(train_edx, removed)
+
+rm(temp_edx, removed)
+```
+
+Our first attempt at predicting user ratings is to predict every rating to equal the average of all user ratings. In order to determine the effectiveness of the model, we compute the root mean squared error (RMSE), which is the standard deviation of the prediction errors. For all models, we evaluate the RMSE with respect to the test_edx set, and once the best model has been selected, we will evaluate on the validation set. 
+```{r simple_model}
+#Simple model based on overall average of all ratings
+ovrl_avg = mean(train_edx$rating)
+
+#Predict all movies to have the average rating
+simple_RMSE = RMSE(test_edx$rating, ovrl_avg)
+simple_RMSE 
+```
+
+The RMSE for this model on the test set is 1.059904. This is our baseline RMSE, and any subsequent models should have a better (lower) RMSE than this model.
+
+To improve the model, we can take the movie effects into account. We predict a user rating for a particular movie based on how other users have rated the same movie. For example, a really well-regarded classic film would generally have much higher ratings than the average. The model's predictions would accommodate the average ratings of each movie instead of just the overall average rating. 
+```{r movie_effect_model}
+#Model based on movie effects
+movie_avg = train_edx %>%
+  group_by(movieId) %>%
+  summarize(movie_i = mean(rating - ovrl_avg))
+
+#Predict based on the average rating for each movie
+movie_based_pred = test_edx %>%
+  left_join(movie_avg, by = 'movieId') %>%
+  mutate(pred = ovrl_avg + movie_i) %>%
+  pull(pred)
+
+movie_RMSE = RMSE(test_edx$rating, movie_based_pred)
+movie_RMSE
+```
+
+To further improve the model, we can add user effects to the movie effects. For example, a harsh critic will tend to give lower ratings, so we can predict his ratings to be lower than the average. Furthermore, we include movie effects as well to prevent the prediction from being too low for a generally well-received movie. 
+```{r um_effect_model}
+#Model based on movie and user effects
+um_avg = train_edx %>%
+  left_join(movie_avg, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(user_i = mean(rating - ovrl_avg - movie_i))
+
+#Predict based on the average rating for each user and movie
+um_pred = test_edx %>%
+  left_join(movie_avg, by = 'movieId') %>%
+  left_join(um_avg, by = 'userId') %>%
+  mutate(pred_um = ovrl_avg + movie_i + user_i) %>%
+  pull(pred_um)
+
+um_RMSE = RMSE(test_edx$rating, um_pred)
+um_RMSE
+```
+
+One further adjustment we can make in the above model is to adjust rating predictions that are not within the acceptable range of 0.5-5. For example, there are over 4000 ratings that are predicted to be above 5. Instead, we can change these predictions to equal 5, since we know that ratings above 5 are not possible. Similarly, we can adjust predictions less than 0.5 to equal 0.5.
+
+```{r unacceptable_ratings}
+sum(um_pred > 5) #4311 ratings predicted above 5.0
+sum(um_pred < 0.5) #229 ratings predicted below 0.5
+```
+
+```{r um_effect_model_adj}
+#Predict based on the average rating for each user and movie with adjustment for unacceptable ratings.
+um_adj_pred = test_edx %>%
+  left_join(movie_avg, by = 'movieId') %>%
+  left_join(um_avg, by = 'userId') %>%
+  mutate(pred_um = ovrl_avg + movie_i + user_i) %>%
+  mutate(pred_um_adj = ifelse(pred_um > 5, 5.0, 
+                       ifelse(pred_um < 0.5, 0.5, pred_um))) %>%
+  pull(pred_um_adj)
+
+um_rmse_adj = RMSE(test_edx$rating, um_adj_pred)
+um_rmse_adj
+```
+There is a minor improvement in the RMSE after this adjustment. Now, we can also try accounting for genre effects with the adjustment to ratings outside the acceptable range. 
+
+<!-- ```{r umg_effect_model} -->
+<!-- #Model based on movie, user, and genre effects -->
+<!-- umg_avg = train_edx %>% -->
+<!--   left_join(movie_avg, by = "movieId") %>% -->
+<!--   left_join(um_avg, by = "userId") %>% -->
+<!--   group_by(genres) %>% -->
+<!--   summarize(genre_i = mean(rating - ovrl_avg - movie_i - user_i)) -->
+
+<!-- #Predict based on the average rating for each user, movie, and genre -->
+<!-- umg_pred = test_edx %>% -->
+<!--   left_join(movie_avg, by = 'movieId') %>% -->
+<!--   left_join(um_avg, by = 'userId') %>% -->
+<!--   left_join(umg_avg, by = 'genres') %>% -->
+<!--   mutate(pred_umg = ovrl_avg + movie_i + user_i + genre_i) %>% -->
+<!--   pull(pred_umg) -->
+<!--   # mutate(pred_umg2 = if_else(pred_umg>=5,5.0,pred_umg)) %>% -->
+<!--   # pull(pred_umg2) -->
+
+<!-- RMSE(test_edx$rating, umg_pred) -->
+<!-- ``` -->
+
+<!-- Again, we can make an adjustment to ratings falling predicted outside the acceptable range.  -->
+
+```{r umg_effect_model_adj}
+#Model based on movie, user, and genre effects
+umg_avg = train_edx %>%
+  left_join(movie_avg, by = "movieId") %>%
+  left_join(um_avg, by = "userId") %>%
+  group_by(genres) %>%
+  summarize(genre_i = mean(rating - ovrl_avg - movie_i - user_i))
+
+#Predict based on the average rating for each user, movie, and genre with adjustment
+umg_pred_adj = test_edx %>%
+  left_join(movie_avg, by = 'movieId') %>%
+  left_join(um_avg, by = 'userId') %>%
+  left_join(umg_avg, by = 'genres') %>%
+  mutate(pred_umg = ovrl_avg + movie_i + user_i + genre_i) %>%
+  mutate(pred_umg_adj = ifelse(pred_umg > 5, 5.0, 
+                        ifelse(pred_umg < 0.5, 0.5, pred_umg))) %>%
+  pull(pred_umg_adj)
+
+umg_RMSE_adj = RMSE(test_edx$rating, umg_pred_adj)
+umg_RMSE_adj
+```
+
+Now, let's try factoring in the effect of year into our model and adjust for ratings outside the acceptable range. To do this, we have to convert the timestamp to a date object using the as.Date.POSIXct function. Then we extract the year from this object.
+
+```{r umgy_effect_model}
+#Model based on movie, user, genre, and year effects
+umgy_avg = train_edx %>%
+  left_join(movie_avg, by = "movieId") %>%
+  left_join(um_avg, by = "userId") %>% 
+  left_join(umg_avg, by = "genres") %>%
+  mutate(year = year(as.Date.POSIXct(timestamp))) %>%
+  group_by(year) %>%
+  summarize(year_i = mean(rating - ovrl_avg - movie_i - user_i -                       genre_i))
+
+#Predict based on the average rating for each user, movie, genre, and year
+umgy_pred = test_edx %>%
+  mutate(year = year(as.Date.POSIXct(timestamp))) %>%
+  left_join(movie_avg, by = 'movieId') %>%
+  left_join(um_avg, by = 'userId') %>%
+  left_join(umg_avg, by = 'genres') %>%
+  left_join(umgy_avg, by = 'year') %>%
+  mutate(pred_umgy = ovrl_avg + movie_i + user_i + genre_i +                          year_i) %>%
+  mutate(pred_umgy_adj = ifelse(pred_umgy > 5, 5.0, 
+                        ifelse(pred_umgy < 0.5, 0.5, pred_umgy))) %>%
+  pull(pred_umgy_adj)
+
+umgy_RMSE_adj = RMSE(test_edx$rating, umgy_pred)
+umgy_RMSE_adj
+```
+
+The RMSE for the model taking into account movie, user, genre, and year effects is **0.8653532**. It appears that by adding genre and year effects, we achieved slight improvements in RMSE. In the next section, we use regularization to try and get more improvements in RMSE. 
+
+### Regularization Methods
+Until this point, the models we have constructed do not account for the sample size effect on our predictions. For example, a movie with very few ratings might be skewing the predictions in an unfavorable direction. With regularization, we can penalize these estimates and prevent them from having large impacts on our predictions.  
+
+We can start by regularizing the model which accounts for movie and user effects. We use a range of lambda values as the regularization parameter, and select the value which gives the lowest RMSE. We also generate a plot to visually show the lambda values against the RMSE values. 
+
+```{r um_effect_model_reg}
+lambdas <- seq(0, 10, 0.5)
+
+rmses <- sapply(lambdas, function(l){
+  
+  mu <- mean(train_edx$rating)
+  
+  b_i <- train_edx %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  
+  b_u <- train_edx %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  predicted_ratings <- 
+    test_edx %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred_um_reg = mu + b_i + b_u) %>%
+    mutate(pred_um_reg_adj = ifelse(pred_um_reg > 5, 5.0, 
+                             ifelse(pred_um_reg < 0.5, 0.5, 
+                                    pred_um_reg))) %>% 
+    pull(pred_um_reg_adj)
+  
+  return(RMSE(predicted_ratings, test_edx$rating))
+})
+
+qplot(lambdas, rmses)
+
+min_lambda_um_reg = lambdas[which.min(rmses)] 
+min_lambda_um_reg #lambda = 4.5 provides lowest RMSE
+min_rmse_um_reg = min(rmses)
+min_rmse_um_reg
+```
+
+For this regularized model accounting for movie and user effects, we see that lambda = 4.5 provides the lowest RMSE of **0.8651262**.
+
+<!-- We can try regularization for our model which accounts for movie, user, and year effects. We decide to include year instead of genre for two reasons. The genre variable has many possible categories, which makes it difficult to detect a pattern of its' effects. Furthermore, the plot of ratings by year shows a clear pattern that earlier movies tend to have higher ratings, which we strive to account for in our model. Again, we adjust for ratings outside the acceptable range of 0-5 to be rounded accordingly. -->
+
+<!-- ```{r umy_effect_model_reg} -->
+<!-- lambdas <- seq(0, 10, 0.5) -->
+
+<!-- rmses_umy <- sapply(lambdas, function(l){ -->
+
+<!--   mu <- mean(train_edx$rating) -->
+
+<!--   b_i <- train_edx %>%  -->
+<!--     group_by(movieId) %>% -->
+<!--     summarize(b_i = sum(rating - mu)/(n()+l)) -->
+
+<!--   b_u <- train_edx %>%  -->
+<!--     left_join(b_i, by="movieId") %>% -->
+<!--     group_by(userId) %>% -->
+<!--     summarize(b_u = sum(rating - b_i - mu)/(n()+l)) -->
+
+<!--   b_y <- train_edx %>% -->
+<!--     mutate(year = year(as.Date.POSIXct(timestamp))) %>% -->
+<!--     left_join(b_i, by="movieId") %>% -->
+<!--     left_join(b_u, by="userId") %>% -->
+<!--     group_by(year) %>% -->
+<!--     summarize(b_y = sum(rating - b_i - b_u - mu)/(n()+l)) -->
+
+<!--   predicted_ratings <- test_edx %>%  -->
+<!--     mutate(year = year(as.Date.POSIXct(timestamp))) %>% -->
+<!--     left_join(b_i, by = "movieId") %>% -->
+<!--     left_join(b_u, by = "userId") %>% -->
+<!--     left_join(b_y, by = "year") %>% -->
+<!--     mutate(pred_umy_reg = mu + b_i + b_u + b_y) %>% -->
+<!--     mutate(pred_umy_reg_adj = ifelse(pred_umy_reg > 5, 5.0,  -->
+<!--                               ifelse(pred_umy_reg < 0.5, 0.5,  -->
+<!--                                      pred_umy_reg))) %>% -->
+<!--     pull(pred_umy_reg_adj) -->
+
+<!--   return(RMSE(predicted_ratings, test_edx$rating)) -->
+<!-- }) -->
+
+<!-- lambdas[which.min(rmses_umy)] #lambda = 5 provides lowest RMSE -->
+<!-- min(rmses_umy) #0.8652421 -->
+<!-- ``` -->
+
+We attempt to regularize the model consisting of movie, user, genre, and year effects. We follow a similar technique as the previous regularized movie and user effect model, but just add in additional terms for genre and year. 
+
+```{r umgy_effect_model_reg}
+lambdas <- seq(0, 10, 0.5)
+
+rmses_umgy <- sapply(lambdas, function(l){
+  
+  mu <- mean(train_edx$rating) #overall average rating
+  
+  #effect of movie i
+  b_i <- train_edx %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  
+  #effect of user u
+  b_u <- train_edx %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  #effect of genre g
+  b_g <- train_edx %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    group_by(genres) %>%
+    summarize(b_g = sum(rating - b_i - b_u - mu)/(n()+l))
+  
+  #effect of year y
+  b_y <- train_edx %>%
+    mutate(year = year(as.Date.POSIXct(timestamp))) %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    left_join(b_g, by = "genres") %>%
+    group_by(year) %>%
+    summarize(b_y = sum(rating - b_i - b_u - b_g - mu)/(n()+l))
+  
+  #predict the ratings for the test_edx set
+  predicted_ratings <- test_edx %>% 
+    mutate(year = year(as.Date.POSIXct(timestamp))) %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    left_join(b_g, by = "genres") %>%
+    left_join(b_y, by = "year") %>%
+    mutate(pred_umgy_reg = mu + b_i + b_u + b_g + b_y) %>%
+    mutate(pred_umgy_reg_adj = ifelse(pred_umgy_reg > 5, 5.0, 
+                              ifelse(pred_umgy_reg < 0.5, 0.5, 
+                                     pred_umgy_reg))) %>%
+    pull(pred_umgy_reg_adj)
+  
+  return(RMSE(predicted_ratings, test_edx$rating))
+})
+
+min_lambda_umgy_reg = lambdas[which.min(rmses_umgy)] 
+min_lambda_umgy_reg #lambda = 4.5 provides lowest RMSE
+min_rmse_umgy_reg = min(rmses_umgy)
+min_rmse_umgy_reg #0.8647711
+```
+
+A summary of the RMSE values for each model we have tried is shown below. The models were build using the train_edx set and tested on the test_edx set. For our final step, we will make our predictions on the validation set using the edx set. 
+
+| Model         | RMSE on test_edx          | 
+| ------------- |:-------------:| 
+| Average                       | 1.059904 | 
+| Movie Effect                  | 0.9437429      | 
+| Movie + User Effect           | 0.8659319      | 
+| Movie + User Effect (adj.)    | 0.865716      | 
+| Movie + User + Genre Effect (adj.) | 0.8653702 | 
+| Movie + User + Genre + Year Effect (adj.) | 0.8653532  | 
+| Regularized Movie + User (adj.) | 0.8651262  | 
+| Regularized Movie + User + Genre + Year Effect (adj.) | 0.8647711| 
+
+
+## Results
+After all the inital modeling efforts, we decided upon the best model to use, and now measure the performance of this model on the validation (test) set. The final model uses regularization and takes into account movie, user, genre, and year effects. It also adjusts any ratings outside the acceptable range. 
+
+The final model equation is as follows:
+$Y_{u,i} = \mu + b_i + b_u + \sum_{j=1}^{J} x_{u,i}^{j} \beta_j + \sum_{k=1}^{K} x_{u,i}^{k} \beta_k + adj + \varepsilon_{u,i}$
+
+where 
+
+$\mu$ = average of all ratings
+
+$b_i$ = effect of movie $i$
+
+$b_u$ = effect of user $u$
+
+$x^j_{u,i} = 1$ if $y_{u,i}$ (year for user u's ratings of movie i) is year $j$
+
+$\beta_j$ = effect of year $j$ for $j=1,...,J$
+
+$x^k_{u,i} = 1$ if $g_{u,i}$ (genre for user u's ratings of movie i) is genre $k$
+
+$\beta_k$ = effect of genre $k$ for $k=1,...,K$
+
+$adj$ = the adjustment term to keep the predicted rating within 0.5 to 5.
+
+$\varepsilon_{u,i}$ = independent errors sampled from the same distribution centered at 0 
+
+This model is regularized with $\lambda = 4.5$ chosen as the regularization parameter.
+
+```{r umgy_effect_model_reg_edx}
+#Use the regularized user, movie, genre, and year model
+#Build the model using edx set. Test the model on the validation set.
+lambda <- 4.5 #Selected from model in previous section
+
+rmses_umgy_edx_fn <- function(l){
+  # This function constructs the regularized model on the edx set 
+  # given input lambda (l) and calculates RMSE on the validation set
+  
+  mu <- mean(edx$rating) #overall average rating
+  
+  #effect of movie i
+  b_i <- edx %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  
+  #effect of user u
+  b_u <- edx %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  #effect of genre g
+  b_g <- train_edx %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    group_by(genres) %>%
+    summarize(b_g = sum(rating - b_i - b_u - mu)/(n()+l))
+  
+  #effect of year y
+  b_y <- edx %>%
+    mutate(year = year(as.Date.POSIXct(timestamp))) %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    left_join(b_g, by = "genres") %>%
+    group_by(year) %>%
+    summarize(b_y = sum(rating - b_i - b_u - b_g - mu)/(n()+l))
+  
+  #predict the ratings for the validation set
+  predicted_ratings <- validation %>% 
+    mutate(year = year(as.Date.POSIXct(timestamp))) %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    left_join(b_g, by = "genres") %>%
+    left_join(b_y, by = "year") %>%
+    mutate(pred_umgy_reg = mu + b_i + b_u + b_g + b_y) %>%
+    mutate(pred_umgy_reg_adj = ifelse(pred_umgy_reg > 5, 5.0, 
+                                      ifelse(pred_umgy_reg < 0.5, 0.5, 
+                                             pred_umgy_reg))) %>%
+    pull(pred_umgy_reg_adj)
+  
+  ratings_and_RMSE_list = list(head(predicted_ratings, 50), 
+                               RMSE(predicted_ratings, validation$rating))
+  return(ratings_and_RMSE_list)
+}
+
+#Return the ratings and RMSE on the validation set using lambda = 4.5
+rmses_umgy_edx_fn(lambda) #0.8642996
+```
+
+The results show some of the ratings predicted by users. Our final model provides an RMSE of **0.8642996** on the validation set, which is our best result.  
+
+## Conclusion
+Through careful analysis and modeling efforts, we have provided a way to predict user ratings for movies. The driving factors for our prediction are the movie and user effects. The movie effect allows us to predict the ratings based on the overall ratings of a movie, while the user effect allows us to predict the ratings based on how harshly a user tends to review. Additional variables for genre and year were included based on exploratory analysis which there are some patterns to exploit from these variables. Our adjustment to keep all predicted ratings within the scale of 0.5 to 5 is a sort of sanity check which keeps predictions from being too far off the mark. Lastly, regularization was applied to reduce impacts of variables with small sample size from skewing the predictions. 
+
+## References
+https://rafalab.github.io/dsbook/large-datasets.html#recommendation-systems
+Some of the modeling code was based off of code provided in the course textbook under the Recommendation Systems and Regularization Sections. 
+All code used for this project can be viewed in the R script file in this directory.
