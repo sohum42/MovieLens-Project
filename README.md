@@ -1,4 +1,4 @@
-# MovieLens-Project
+# MovieLens Project
 The MovieLens dataset contains roughly 10 million ratings of movies, provided by 100,000 users. The goal
 of this project is to predict the ratings that a user will give to movies they have not yet rated. We start
 by exploring the variables in the dataset, such as the distribution of the ratings and which movies have
